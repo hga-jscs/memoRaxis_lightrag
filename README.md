@@ -1,0 +1,2 @@
+# memoRaxis_lightrag
+这个仓库致力于将lightrag的代码整合进入memoRaxis并进行测试
