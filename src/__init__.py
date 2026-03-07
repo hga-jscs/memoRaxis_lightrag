@@ -6,7 +6,6 @@ from .config import Config, get_config
 from .memory_interface import Evidence, BaseMemorySystem, MockMemory
 from .llm_interface import BaseLLMClient, MockLLMClient, OpenAIClient
 from .adaptors import SingleTurnAdaptor, IterativeAdaptor, PlanAndActAdaptor
-from .simple_memory import SimpleRAGMemory
 
 __all__ = [
     "get_logger",
