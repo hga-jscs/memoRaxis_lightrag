@@ -124,7 +124,7 @@ def main():
         choices=["naive", "mix", "local", "global", "hybrid"],
         help="LightRAG query mode (start with naive)",
     )
-    parser.add_argument("--output_suffix", type=str, default="lightrag", help="Suffix for output filename")
+    parser.add_argument("--output_suffix", type=str, default="", help="Suffix for output filename")
     args = parser.parse_args()
 
     indices = parse_instance_indices(args.instance_idx)
