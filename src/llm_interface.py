@@ -7,6 +7,7 @@
 import json
 import re
 from abc import ABC, abstractmethod
+from collections import defaultdict
 from typing import Any, Dict, Optional
 
 try:
@@ -15,6 +16,7 @@ except ImportError:
     OpenAI = None
 
 from .logger import get_logger
+from .token_ledger import TokenLedger
 
 
 class BaseLLMClient(ABC):
@@ -57,6 +59,7 @@ class OpenAIClient(BaseLLMClient):
         model: str,
         temperature: float = 0.7,
         max_tokens: int = 2000,
+        ledger: Optional[TokenLedger] = None,
     ):
         if OpenAI is None:
             raise ImportError("请先安装 openai 库: pip install openai")
@@ -67,19 +70,68 @@ class OpenAIClient(BaseLLMClient):
         self._temperature = temperature
         self._max_tokens = max_tokens
         self._total_tokens = 0
+        self._ledger = ledger
+        self._usage_breakdown = defaultdict(
+            lambda: {
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0,
+                "api_calls": 0,
+            }
+        )
 
     @property
     def total_tokens(self) -> int:
         """返回 Token 消耗 (估算或从 API 返回获取)"""
         return self._total_tokens
 
+    @property
+    def usage_breakdown(self) -> Dict[str, Dict[str, int]]:
+        """返回分阶段 token 统计。"""
+        return {k: dict(v) for k, v in self._usage_breakdown.items()}
+
     def reset_stats(self) -> None:
         """重置统计"""
         self._total_tokens = 0
+        self._usage_breakdown.clear()
+
+    def _record_usage(
+        self,
+        *,
+        stage: str,
+        substage: str,
+        prompt_tokens: int,
+        completion_tokens: int,
+        total_tokens: int,
+        prompt_chars: int,
+    ) -> None:
+        key = stage if not substage else f"{stage}.{substage}"
+        bucket = self._usage_breakdown[key]
+        bucket["prompt_tokens"] += prompt_tokens
+        bucket["completion_tokens"] += completion_tokens
+        bucket["total_tokens"] += total_tokens
+        bucket["api_calls"] += 1
+
+        self._total_tokens += total_tokens
+
+        if self._ledger is not None:
+            self._ledger.add(
+                stage=stage,
+                substage=substage,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=total_tokens,
+                api_calls=1,
+                model=self._model,
+                provider="openai_compat",
+                prompt_chars=prompt_chars,
+            )
 
     def generate(self, prompt: str, **kwargs) -> str:
         """调用 OpenAI 生成文本"""
         self._logger.debug("OpenAI generate 调用")
+        stage = kwargs.pop("stage", "infer.adaptor")
+        substage = kwargs.pop("substage", "generate")
         try:
             response = self._client.chat.completions.create(
                 model=self._model,
@@ -87,12 +139,23 @@ class OpenAIClient(BaseLLMClient):
                 temperature=kwargs.get("temperature", self._temperature),
                 max_tokens=kwargs.get("max_tokens", self._max_tokens),
             )
-            
+
             content = response.choices[0].message.content
-            
-            if response.usage:
-                self._total_tokens += response.usage.total_tokens
-                
+
+            usage = response.usage
+            prompt_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
+            completion_tokens = int(getattr(usage, "completion_tokens", 0) or 0)
+            total_tokens = int(getattr(usage, "total_tokens", prompt_tokens + completion_tokens) or 0)
+
+            self._record_usage(
+                stage=stage,
+                substage=substage,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=total_tokens,
+                prompt_chars=len(prompt),
+            )
+
             return content
         except Exception as e:
             self._logger.error("OpenAI 调用失败: %s", e)
@@ -101,10 +164,18 @@ class OpenAIClient(BaseLLMClient):
     def generate_json(self, prompt: str, **kwargs) -> Dict[str, Any]:
         """调用 OpenAI 生成 JSON"""
         self._logger.debug("OpenAI generate_json 调用")
+        stage = kwargs.pop("stage", "infer.adaptor")
+        substage = kwargs.pop("substage", "generate_json")
         # 强制添加 JSON 指令
         json_prompt = prompt + "\n\n请确保输出为纯 JSON 格式，不要包含 Markdown 代码块标记。"
-        
-        content = self.generate(json_prompt, temperature=0.1, **kwargs) # 低温以保证结构稳定
+
+        content = self.generate(
+            json_prompt,
+            temperature=0.1,
+            stage=stage,
+            substage=substage,
+            **kwargs,
+        )  # 低温以保证结构稳定
         
         return self._parse_json(content)
 

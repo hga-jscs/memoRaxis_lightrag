@@ -27,6 +27,11 @@ except Exception as exc:  # pragma: no cover - import message is for runtime erg
         "不要安装同名但不兼容的 `lightrag`。"
     ) from exc
 
+try:
+    from lightrag.utils import TokenTracker
+except Exception:  # pragma: no cover - optional across LightRAG versions
+    TokenTracker = None  # type: ignore
+
 logger = get_logger()
 _VALID_QUERY_MODES = {"naive", "local", "global", "hybrid", "mix", "bypass"}
 
@@ -68,6 +73,8 @@ class LightRAGMemory(BaseMemorySystem):
         self.mode = self._normalize_mode(mode)
         self._buf = _Buffers()
         self._initialized = False
+        self._session_events: List[Dict[str, Any]] = []
+        self._token_tracker = TokenTracker() if TokenTracker is not None else None
 
         conf = get_config()
         self._llm_conf = conf.llm
@@ -600,6 +607,63 @@ class LightRAGMemory(BaseMemorySystem):
 
         return self._context_result_to_evidences(context, query=query, top_k=top_k)
 
+    def begin_token_session(self) -> None:
+        self._session_events = []
+
+    def end_token_session(self) -> Dict[str, Any]:
+        total = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "api_calls": 0}
+        for ev in self._session_events:
+            total["prompt_tokens"] += ev.get("prompt_tokens", 0)
+            total["completion_tokens"] += ev.get("completion_tokens", 0)
+            total["total_tokens"] += ev.get("total_tokens", 0)
+            total["api_calls"] += ev.get("api_calls", 0)
+        return {"total": total, "events": list(self._session_events)}
+
+    @staticmethod
+    def _normalize_tracker_usage(usage: Any) -> Dict[str, int]:
+        if usage is None:
+            return {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "api_calls": 0}
+        if not isinstance(usage, dict):
+            usage = {
+                "prompt_tokens": getattr(usage, "prompt_tokens", 0),
+                "completion_tokens": getattr(usage, "completion_tokens", 0),
+                "total_tokens": getattr(usage, "total_tokens", 0),
+                "api_calls": getattr(usage, "api_calls", 0),
+                "llm_call_count": getattr(usage, "llm_call_count", 0),
+            }
+
+        prompt_tokens = int(usage.get("prompt_tokens", usage.get("input_tokens", 0)) or 0)
+        completion_tokens = int(usage.get("completion_tokens", usage.get("output_tokens", 0)) or 0)
+        total_tokens = int(usage.get("total_tokens", prompt_tokens + completion_tokens) or 0)
+        api_calls = int(usage.get("api_calls", usage.get("llm_call_count", 0)) or 0)
+        return {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens,
+            "api_calls": api_calls,
+        }
+
+    def _track_lightrag_stage(self, stage: str, fn: Any, **meta: Any) -> Any:
+        if self._token_tracker is None:
+            result = fn()
+            self._session_events.append({
+                "stage": stage,
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0,
+                "api_calls": 0,
+                "meta": {**meta, "tracker_available": False},
+            })
+            return result
+
+        self._token_tracker.reset()
+        with self._token_tracker:
+            result = fn()
+        usage = self._normalize_tracker_usage(self._token_tracker.get_usage())
+        self._session_events.append({"stage": stage, **usage, "meta": meta})
+        logger.info("[LightRAGMemory][TokenTracker] stage=%s usage=%s meta=%s", stage, usage, meta)
+        return result
+
     # ------------------------------------------------------------------
     # BaseMemorySystem API
     # ------------------------------------------------------------------
@@ -637,10 +701,16 @@ class LightRAGMemory(BaseMemorySystem):
 
         try:
             # 同步接口（内部会 run_until_complete）
-            self._rag.insert_custom_chunks(
-                full_text=full_text,
-                text_chunks=list(self._buf.chunks),
-                doc_id=str(resolved_doc_id) if resolved_doc_id else None,
+            self._track_lightrag_stage(
+                "ingest.insert_custom_chunks",
+                lambda: self._rag.insert_custom_chunks(
+                    full_text=full_text,
+                    text_chunks=list(self._buf.chunks),
+                    doc_id=str(resolved_doc_id) if resolved_doc_id else None,
+                ),
+                mode=self.mode,
+                doc_id=resolved_doc_id,
+                chunk_count=len(self._buf.chunks),
             )
         except Exception:
             logger.exception("[LightRAGMemory] insert_custom_chunks failed (doc_id=%r)", resolved_doc_id)
@@ -662,16 +732,31 @@ class LightRAGMemory(BaseMemorySystem):
             return []
 
         if self.mode == "naive":
-            return self._retrieve_naive(q, k)
+            return self._track_lightrag_stage(
+                "infer.memory.naive",
+                lambda: self._retrieve_naive(q, k),
+                mode=self.mode,
+                top_k=k,
+            )
 
-        structured_payload = self._query_structured_data(q, top_k=k)
+        structured_payload = self._track_lightrag_stage(
+            "infer.memory.query_data",
+            lambda: self._query_structured_data(q, top_k=k),
+            mode=self.mode,
+            top_k=k,
+        )
         if structured_payload:
             evidences = self._structured_payload_to_evidences(structured_payload, query=q, top_k=k)
             if evidences:
                 return evidences
 
         # 兼容旧版 LightRAG：没有 query_data / aquery_data 时回退。
-        evidences = self._retrieve_by_context_fallback(q, k)
+        evidences = self._track_lightrag_stage(
+            "infer.memory.context_fallback",
+            lambda: self._retrieve_by_context_fallback(q, k),
+            mode=self.mode,
+            top_k=k,
+        )
         if evidences:
             return evidences
 
@@ -679,7 +764,12 @@ class LightRAGMemory(BaseMemorySystem):
             "[LightRAGMemory] mode=%s retrieval returned no structured evidence; fallback to naive chunks_vdb.query.",
             self.mode,
         )
-        return self._retrieve_naive(q, k)
+        return self._track_lightrag_stage(
+            "infer.memory.naive_fallback",
+            lambda: self._retrieve_naive(q, k),
+            mode=self.mode,
+            top_k=k,
+        )
 
     def reset(self) -> None:
         """

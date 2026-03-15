@@ -1,4 +1,5 @@
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -37,6 +38,7 @@ def ingest_one_instance(
 
     # Initialize LightRAG Memory
     memory = LightRAGMemory(working_dir=str(out_dir), mode=mode)
+    memory.begin_token_session()
     if reset:
         memory.reset()
 
@@ -48,6 +50,23 @@ def ingest_one_instance(
 
     # Build index & persist into working_dir (no .pkl file)
     memory.build_index(doc_id=f"acc_ret_{instance_idx}")
+
+    token_report = memory.end_token_session()
+    sidecar = {
+        "dataset": "Accurate_Retrieval",
+        "instance_idx": instance_idx,
+        "stage": "ingest",
+        "chunk_count": len(chunks),
+        "chunk_size": chunk_size,
+        "char_count": len(data.get("context", "")),
+        "mode": mode,
+        "token_report": token_report,
+    }
+    report_dir = Path("out/token_reports")
+    report_dir.mkdir(parents=True, exist_ok=True)
+    report_path = report_dir / f"ingest_acc_{instance_idx}.json"
+    report_path.write_text(json.dumps(sidecar, ensure_ascii=False, indent=2), encoding="utf-8")
+    logger.info("[ingest-token-debug] %s", json.dumps(token_report.get("total", {}), ensure_ascii=False))
 
     print(f"\nIngestion complete. LightRAG workspace saved at: {out_dir}")
 

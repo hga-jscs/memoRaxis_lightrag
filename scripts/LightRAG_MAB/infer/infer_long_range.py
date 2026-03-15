@@ -1,139 +1,78 @@
 import argparse
-import sys
 import json
+import sys
 from pathlib import Path
 
-# Add project root to sys.path
-PROJECT_ROOT = Path(__file__).resolve().parents[3]  # D:\memoRaxis
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
 sys.path.append(str(PROJECT_ROOT))
 
-from src.logger import get_logger
 from src.benchmark_utils import parse_instance_indices
-from src.adaptors import run_r1_single_turn, run_r2_iterative, run_r3_plan_act
 from src.lightrag_memory import LightRAGMemory
+from src.logger import get_logger
+from src.runner_utils import run_one_question
 
 logger = get_logger()
 
 
-def evaluate_instance(
-    instance_idx: int,
-    adaptors: list,
-    limit: int = -1,
-    output_suffix: str = "",
-    storage_dir: str = "out/lightrag_storage",
-    mode: str = "naive",
-):
-    logger.info(f"=== Evaluating Long_Range_Understanding Instance {instance_idx} (LightRAG) ===")
-
-    data_path = f"MemoryAgentBench/preview_samples/Long_Range_Understanding/instance_{instance_idx}.json"
-    if not Path(data_path).exists():
-        logger.error(f"Data file not found: {data_path}")
+def evaluate_instance(instance_idx: int, adaptors: list, limit: int = -1, output_suffix: str = "", storage_dir: str = "out/lightrag_storage", mode: str = "naive"):
+    data_path = Path(f"MemoryAgentBench/preview_samples/Long_Range_Understanding/instance_{instance_idx}.json")
+    if not data_path.exists():
+        logger.error("Data file not found: %s", data_path)
         return
+    data = json.loads(data_path.read_text(encoding="utf-8"))
 
-    with open(data_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-
-    # Load LightRAG workspace (folder, not .pkl)
     workspace = Path(storage_dir) / f"lightrag_long_range_{instance_idx}"
     if not workspace.exists():
-        logger.error(f"LightRAG workspace not found: {workspace} (run ingest first)")
+        logger.error("LightRAG workspace not found: %s", workspace)
         return
 
-    logger.info(f"Using LightRAG workspace: {workspace}")
     memory = LightRAGMemory(working_dir=str(workspace), mode=mode)
-
-    questions = data["questions"]
-    answers = data["answers"]
-
+    questions, answers = data["questions"], data["answers"]
     if limit > 0:
-        questions = questions[:limit]
-        answers = answers[:limit]
+        questions, answers = questions[:limit], answers[:limit]
 
-    results = {
-        "dataset": "Long_Range_Understanding",
-        "instance_idx": instance_idx,
-        "results": {},
-    }
-
+    results = {"dataset": "Long_Range_Understanding", "instance_idx": instance_idx, "results": {}}
     for adaptor_name in adaptors:
-        logger.info(f"Running Adaptor: {adaptor_name}")
         adaptor_results = []
-
         for i, (q, a) in enumerate(zip(questions, answers)):
-            logger.info(f"[{adaptor_name}] Q{i+1}/{len(questions)}")
             try:
-                if adaptor_name == "R1":
-                    pred, meta = run_r1_single_turn(q, memory)
-                elif adaptor_name == "R2":
-                    pred, meta = run_r2_iterative(q, memory)
-                elif adaptor_name == "R3":
-                    pred, meta = run_r3_plan_act(q, memory)
-                else:
-                    continue
-
-                adaptor_results.append(
-                    {
-                        "question": q,
-                        "answer": pred,
-                        "ground_truth": a,
-                        "steps": meta.get("steps", 0),
-                        "tokens": meta.get("total_tokens", 0),
-                        "replan": meta.get("replan_count", 0),
-                    }
-                )
+                res, report = run_one_question(adaptor_name, q, memory, dataset="Long_Range_Understanding", instance_idx=instance_idx, question_idx=i)
+                logger.info("[%s] token_debug=%s", adaptor_name, json.dumps(report.get("by_stage", {}), ensure_ascii=False))
+                adaptor_results.append({
+                    "question": q,
+                    "answer": res.answer,
+                    "ground_truth": a,
+                    "steps": res.steps_taken,
+                    "tokens": report["grand_total_tokens"],
+                    "replan": res.replan_count,
+                    "token_report": report,
+                    "token_breakdown": res.token_breakdown,
+                    "memory_token_breakdown": res.memory_token_breakdown,
+                })
             except Exception as e:
-                logger.error(f"Error on Q{i}: {e}")
+                logger.error("Error on Q%s: %s", i, e)
                 adaptor_results.append({"question": q, "error": str(e)})
-
         results["results"][adaptor_name] = adaptor_results
 
     output_dir = Path("out")
     output_dir.mkdir(parents=True, exist_ok=True)
-    filename = f"long_range_results_{instance_idx}"
-    if output_suffix:
-        filename += f"_{output_suffix}"
-    filename += ".json"
-    out_file = output_dir / filename
-
-    with open(out_file, "w", encoding="utf-8") as f:
-        json.dump(results, f, indent=2, ensure_ascii=False)
-
-    logger.info(f"Results saved to {out_file}")
+    out_file = output_dir / (f"long_range_results_{instance_idx}" + (f"_{output_suffix}" if output_suffix else "") + ".json")
+    out_file.write_text(json.dumps(results, indent=2, ensure_ascii=False), encoding="utf-8")
+    logger.info("Results saved to %s", out_file)
 
 
 def main():
     parser = argparse.ArgumentParser(description="Evaluate Long_Range_Understanding (LightRAG)")
-    # 默认 Top 40
-    parser.add_argument("--instance_idx", type=str, default="0-39", help="e.g., '0-39'")
-    parser.add_argument("--adaptor", nargs="+", default=["R1", "R2"], help="R1, R2, R3")
+    parser.add_argument("--instance_idx", type=str, default="0-39")
+    parser.add_argument("--adaptor", nargs="+", default=["R1", "R2"])
     parser.add_argument("--limit", type=int, default=-1)
-
-    parser.add_argument(
-        "--storage_dir",
-        type=str,
-        default="out/lightrag_storage",
-        help="Directory containing LightRAG workspaces",
-    )
-    parser.add_argument(
-        "--mode",
-        type=str,
-        default="naive",
-        choices=["naive", "mix", "local", "global", "hybrid"],
-        help="LightRAG query mode (start with naive)",
-    )
-    parser.add_argument("--output_suffix", type=str, default="lightrag", help="Suffix for output filename")
+    parser.add_argument("--storage_dir", type=str, default="out/lightrag_storage")
+    parser.add_argument("--mode", type=str, default="naive", choices=["naive", "mix", "local", "global", "hybrid"])
+    parser.add_argument("--output_suffix", type=str, default="lightrag")
     args = parser.parse_args()
 
-    indices = parse_instance_indices(args.instance_idx)
-    for idx in indices:
-        evaluate_instance(
-            instance_idx=idx,
-            adaptors=args.adaptor,
-            limit=args.limit,
-            output_suffix=args.output_suffix,
-            storage_dir=args.storage_dir,
-            mode=args.mode,
-        )
+    for idx in parse_instance_indices(args.instance_idx):
+        evaluate_instance(idx, args.adaptor, args.limit, args.output_suffix, args.storage_dir, args.mode)
 
 
 if __name__ == "__main__":
