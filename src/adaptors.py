@@ -25,6 +25,8 @@ class AdaptorResult:
     token_consumption: int = 0
     replan_count: int = 0
     evidence_collected: List[Evidence] = field(default_factory=list)
+    token_breakdown: Dict[str, Any] = field(default_factory=dict)
+    memory_token_breakdown: Dict[str, Any] = field(default_factory=dict)
 
 
 class BaseAdaptor(ABC):
@@ -35,6 +37,20 @@ class BaseAdaptor(ABC):
         self._memory = memory_system
         self._logger = get_logger()
         self._config = get_config()
+
+    def _begin_run_accounting(self) -> None:
+        if hasattr(self._llm, "reset_stats"):
+            self._llm.reset_stats()
+        if hasattr(self._memory, "begin_token_session"):
+            self._memory.begin_token_session()
+
+    def _collect_accounting(self) -> tuple[int, Dict[str, Any], Dict[str, Any]]:
+        token_consumption = getattr(self._llm, "total_tokens", 0)
+        token_breakdown = getattr(self._llm, "usage_breakdown", {})
+        memory_token_breakdown = {}
+        if hasattr(self._memory, "end_token_session"):
+            memory_token_breakdown = self._memory.end_token_session()
+        return token_consumption, token_breakdown, memory_token_breakdown
 
     @abstractmethod
     def run(self, task: str) -> AdaptorResult:
@@ -89,6 +105,7 @@ class SingleTurnAdaptor(BaseAdaptor):
             AdaptorResult
         """
         self._logger.info("[SingleTurn] 开始处理任务: %s", task)
+        self._begin_run_accounting()
 
         # 步骤 1: 检索
         evidences = self._memory.retrieve(task, top_k=top_k)
@@ -98,10 +115,9 @@ class SingleTurnAdaptor(BaseAdaptor):
         prompt = self._config.get_prompt("single_turn", "synthesis").format(
             task=task, evidence_list=self._format_evidence_list(evidences)
         )
-        answer = self._llm.generate(prompt)
+        answer = self._llm.generate(prompt, stage="infer.adaptor", substage="R1.synthesis")
 
-        # 获取 Token 统计（如果 LLM 客户端支持）
-        token_consumption = getattr(self._llm, "total_tokens", 0)
+        token_consumption, token_breakdown, memory_token_breakdown = self._collect_accounting()
 
         self._logger.info("[SingleTurn] 任务完成")
 
@@ -110,6 +126,8 @@ class SingleTurnAdaptor(BaseAdaptor):
             steps_taken=1,
             token_consumption=token_consumption,
             evidence_collected=evidences,
+            token_breakdown=token_breakdown,
+            memory_token_breakdown=memory_token_breakdown,
         )
 
 
@@ -144,6 +162,7 @@ class IterativeAdaptor(BaseAdaptor):
             AdaptorResult
         """
         self._logger.info("[Iterative] 开始处理任务: %s", task)
+        self._begin_run_accounting()
 
         all_evidences: List[Evidence] = []
         previous_queries: List[str] = []
@@ -164,7 +183,9 @@ class IterativeAdaptor(BaseAdaptor):
             )
 
             # 获取决策
-            decision = self._llm.generate_json(decision_prompt)
+            decision = self._llm.generate_json(
+                decision_prompt, stage="infer.adaptor", substage="R2.decision"
+            )
             action = decision.get("action", "ANSWER")
 
             if action == "ANSWER":
@@ -183,9 +204,9 @@ class IterativeAdaptor(BaseAdaptor):
         synthesis_prompt = self._config.get_prompt("iterative", "synthesis").format(
             task=task, evidence_list=self._format_evidence_list(all_evidences)
         )
-        answer = self._llm.generate(synthesis_prompt)
+        answer = self._llm.generate(synthesis_prompt, stage="infer.adaptor", substage="R2.synthesis")
 
-        token_consumption = getattr(self._llm, "total_tokens", 0)
+        token_consumption, token_breakdown, memory_token_breakdown = self._collect_accounting()
 
         self._logger.info("[Iterative] 任务完成，共 %d 步", steps)
 
@@ -194,6 +215,8 @@ class IterativeAdaptor(BaseAdaptor):
             steps_taken=steps,
             token_consumption=token_consumption,
             evidence_collected=all_evidences,
+            token_breakdown=token_breakdown,
+            memory_token_breakdown=memory_token_breakdown,
         )
 
 
@@ -234,6 +257,7 @@ class PlanAndActAdaptor(BaseAdaptor):
             AdaptorResult
         """
         self._logger.info("[PlanAndAct] 开始处理任务: %s", task)
+        self._begin_run_accounting()
 
         all_evidences: List[Evidence] = []
         executed_steps: List[Dict[str, Any]] = []
@@ -325,9 +349,9 @@ class PlanAndActAdaptor(BaseAdaptor):
             plan_summary=plan_summary,
             evidence_list=self._format_evidence_list(all_evidences),
         )
-        answer = self._llm.generate(synthesis_prompt)
+        answer = self._llm.generate(synthesis_prompt, stage="infer.adaptor", substage="R3.synthesis")
 
-        token_consumption = getattr(self._llm, "total_tokens", 0)
+        token_consumption, token_breakdown, memory_token_breakdown = self._collect_accounting()
 
         self._logger.info(
             "[PlanAndAct] 任务完成，共 %d 步，补充 %d 次", steps, additions_count
@@ -339,12 +363,14 @@ class PlanAndActAdaptor(BaseAdaptor):
             token_consumption=token_consumption,
             replan_count=additions_count,
             evidence_collected=all_evidences,
+            token_breakdown=token_breakdown,
+            memory_token_breakdown=memory_token_breakdown,
         )
 
     def _generate_discovery_step(self, task: str) -> Dict[str, Any]:
         """Phase 1: 生成探索性步骤"""
         prompt = self._config.get_prompt("plan_and_act", "discovery").format(task=task)
-        result = self._llm.generate_json(prompt)
+        result = self._llm.generate_json(prompt, stage="infer.adaptor", substage="R3.discovery")
         return result.get("step", {"description": task})
 
     def _generate_expansion_plan(
@@ -355,7 +381,7 @@ class PlanAndActAdaptor(BaseAdaptor):
             task=task,
             discovery_evidence=self._format_evidence_list(discovery_evidences),
         )
-        result = self._llm.generate_json(prompt)
+        result = self._llm.generate_json(prompt, stage="infer.adaptor", substage="R3.expansion")
         plan = result.get("plan", [])
 
         # 限制步骤数量
@@ -378,7 +404,7 @@ class PlanAndActAdaptor(BaseAdaptor):
             step_description=step_description,
             context=self._format_evidence_list(context_evidences),
         )
-        result = self._llm.generate_json(prompt)
+        result = self._llm.generate_json(prompt, stage="infer.adaptor", substage="R3.query_generation")
         return result.get("query", step_description)
 
     def _check_plan_progress(
@@ -413,7 +439,7 @@ class PlanAndActAdaptor(BaseAdaptor):
             evidence_list=self._format_evidence_list(all_evidences),
             remaining_steps=remaining_str,
         )
-        result = self._llm.generate_json(prompt)
+        result = self._llm.generate_json(prompt, stage="infer.adaptor", substage="R3.plan_check")
         return result
 
     def _log_plan(self, plan: List[Dict[str, Any]], context: str = "") -> None:
@@ -450,7 +476,9 @@ def run_r1_single_turn(task: str, memory_system: BaseMemorySystem) -> tuple[str,
     
     meta = {
         "steps": result.steps_taken,
-        "total_tokens": result.token_consumption
+        "total_tokens": result.token_consumption,
+        "token_breakdown": result.token_breakdown,
+        "memory_token_breakdown": result.memory_token_breakdown,
     }
     return result.answer, meta
 
@@ -467,7 +495,9 @@ def run_r2_iterative(task: str, memory_system: BaseMemorySystem) -> tuple[str, d
     
     meta = {
         "steps": result.steps_taken,
-        "total_tokens": result.token_consumption
+        "total_tokens": result.token_consumption,
+        "token_breakdown": result.token_breakdown,
+        "memory_token_breakdown": result.memory_token_breakdown,
     }
     return result.answer, meta
 
@@ -485,5 +515,7 @@ def run_r3_plan_act(task: str, memory_system: BaseMemorySystem) -> tuple[str, di
     meta = {
         "steps": result.steps_taken,
         "total_tokens": result.token_consumption,
+        "token_breakdown": result.token_breakdown,
+        "memory_token_breakdown": result.memory_token_breakdown,
     }
     return result.answer, meta
