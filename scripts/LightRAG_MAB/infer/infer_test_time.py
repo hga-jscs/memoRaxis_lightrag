@@ -14,7 +14,14 @@ from src.runner_utils import run_one_question
 logger = get_logger()
 
 
-def evaluate_instance(instance_idx: int, adaptors: list, limit: int = -1, output_suffix: str = "", storage_dir: str = "out/lightrag_storage", mode: str = "naive"):
+def evaluate_instance(
+    instance_idx: int,
+    adaptors: list,
+    limit: int = -1,
+    output_suffix: str = "",
+    storage_dir: str = "out/lightrag_storage",
+    mode: str = "naive",
+):
     data_path = Path(f"MemoryAgentBench/preview_samples/Test_Time_Learning/instance_{instance_idx}.json")
     if not data_path.exists():
         logger.error("Data file not found: %s", data_path)
@@ -33,11 +40,20 @@ def evaluate_instance(instance_idx: int, adaptors: list, limit: int = -1, output
         except Exception as e:
             logger.warning("Failed to load checkpoint: %s", e)
 
-    workspace = Path(storage_dir) / f"lightrag_ttl_{instance_idx}"
+    workspace_name = f"lightrag_ttl_{instance_idx}"
+    if output_suffix:
+        workspace_name += f"_{output_suffix}"
+    workspace = Path(storage_dir) / workspace_name
     if not workspace.exists():
-        logger.error("LightRAG workspace not found: %s", workspace)
-        return
+        fallback_workspace = Path(storage_dir) / f"lightrag_ttl_{instance_idx}"
+        if fallback_workspace.exists():
+            logger.warning("Workspace with suffix not found, fallback to %s", fallback_workspace)
+            workspace = fallback_workspace
+        else:
+            logger.error("LightRAG workspace not found: %s", workspace)
+            return
 
+    logger.info("[infer-debug] instance=%s workspace=%s adaptors=%s limit=%s", instance_idx, workspace, adaptors, limit)
     memory = LightRAGMemory(working_dir=str(workspace), mode=mode)
     questions, answers = data["questions"], data["answers"]
     if limit > 0:
@@ -47,10 +63,27 @@ def evaluate_instance(instance_idx: int, adaptors: list, limit: int = -1, output
         adaptor_results = results["results"].setdefault(adaptor_name, [])
         for i in range(len(adaptor_results), len(questions)):
             q, a = questions[i], answers[i]
-            task_query = q + ("\n\nInstruction: Based on the dialogue history, recommend 5 movies. Output their titles or IDs." if instance_idx == 0 else "\n\nInstruction: Classify the intent of the user query based on the labeled examples in memory. Output ONLY the numeric Label ID.")
+            task_query = q + (
+                "\n\nInstruction: Based on the dialogue history, recommend 5 movies. Output their titles or IDs."
+                if instance_idx == 0
+                else "\n\nInstruction: Classify the intent of the user query based on the labeled examples in memory. Output ONLY the numeric Label ID."
+            )
             try:
-                res, report = run_one_question(adaptor_name, task_query, memory, dataset="Test_Time_Learning", instance_idx=instance_idx, question_idx=i)
-                logger.info("[%s] token_debug=%s", adaptor_name, json.dumps(report.get("by_stage", {}), ensure_ascii=False))
+                res, report = run_one_question(
+                    adaptor_name,
+                    task_query,
+                    memory,
+                    dataset="Test_Time_Learning",
+                    instance_idx=instance_idx,
+                    question_idx=i,
+                )
+                memory_token_summary = report.get("memory", {})
+                logger.info(
+                    "[%s] token_debug llm=%s memory_total=%s",
+                    adaptor_name,
+                    json.dumps(report.get("by_stage", {}), ensure_ascii=False),
+                    memory_token_summary.get("total", {}).get("total_tokens", 0),
+                )
                 adaptor_results.append({
                     "question": q,
                     "answer": res.answer,
@@ -61,10 +94,18 @@ def evaluate_instance(instance_idx: int, adaptors: list, limit: int = -1, output
                     "token_report": report,
                     "token_breakdown": res.token_breakdown,
                     "memory_token_breakdown": res.memory_token_breakdown,
+                    "memory_token_summary": memory_token_summary,
                 })
             except Exception as e:
                 adaptor_results.append({"question": q, "error": str(e)})
             out_file.write_text(json.dumps(results, indent=2, ensure_ascii=False), encoding="utf-8")
+
+        total_memory_tokens = sum(
+            item.get("memory_token_summary", {}).get("total", {}).get("total_tokens", 0)
+            for item in adaptor_results
+            if "memory_token_summary" in item
+        )
+        logger.info("[%s] Total Memory Tokens: %s", adaptor_name, total_memory_tokens)
 
     logger.info("Instance %s finished. Results saved to %s", instance_idx, out_file)
 
@@ -76,7 +117,7 @@ def main():
     parser.add_argument("--limit", type=int, default=-1)
     parser.add_argument("--storage_dir", type=str, default="out/lightrag_storage")
     parser.add_argument("--mode", type=str, default="naive", choices=["naive", "mix", "local", "global", "hybrid"])
-    parser.add_argument("--output_suffix", type=str, default="lightrag")
+    parser.add_argument("--output_suffix", type=str, default="")
     args = parser.parse_args()
 
     for idx in parse_instance_indices(args.instance_idx):
