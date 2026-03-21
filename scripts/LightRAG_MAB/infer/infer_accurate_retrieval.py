@@ -54,7 +54,11 @@ def score_and_annotate(results: Dict[str, List[dict]], qa_map: Dict[str, List[st
             item["is_correct"] = bool(ok)
             correct += int(ok)
         total = len(preds)
-        summary[adaptor_name] = {"accuracy": (correct / total) if total else 0.0, "correct_count": correct, "total_questions": total}
+        summary[adaptor_name] = {
+            "accuracy": (correct / total) if total else 0.0,
+            "correct_count": correct,
+            "total_questions": total,
+        }
     return summary
 
 
@@ -64,8 +68,21 @@ def evaluate_adaptor(name: str, questions: list, limit: int, memory: LightRAGMem
     for i, q in enumerate(target_questions):
         logger.info("[%s] Running Q%s/%s", name, i + 1, len(target_questions))
         try:
-            res, report = run_one_question(name, q, memory, dataset="Accurate_Retrieval", instance_idx=instance_idx, question_idx=i)
-            logger.info("[%s] token_debug=%s", name, json.dumps(report.get("by_stage", {}), ensure_ascii=False))
+            res, report = run_one_question(
+                name,
+                q,
+                memory,
+                dataset="Accurate_Retrieval",
+                instance_idx=instance_idx,
+                question_idx=i,
+            )
+            memory_token_summary = report.get("memory", {})
+            logger.info(
+                "[%s] token_debug llm=%s memory_total=%s",
+                name,
+                json.dumps(report.get("by_stage", {}), ensure_ascii=False),
+                memory_token_summary.get("total", {}).get("total_tokens", 0),
+            )
             results.append({
                 "question": q,
                 "answer": res.answer,
@@ -75,21 +92,46 @@ def evaluate_adaptor(name: str, questions: list, limit: int, memory: LightRAGMem
                 "token_report": report,
                 "token_breakdown": res.token_breakdown,
                 "memory_token_breakdown": res.memory_token_breakdown,
+                "memory_token_summary": memory_token_summary,
             })
         except Exception as e:
             logger.error("[%s] Failed on Q%s: %s", name, i + 1, e)
             results.append({"question": q, "error": str(e)})
+
+    total_memory_tokens = sum(
+        item.get("memory_token_summary", {}).get("total", {}).get("total_tokens", 0)
+        for item in results
+        if "memory_token_summary" in item
+    )
+    logger.info("[%s] Total Memory Tokens: %s", name, total_memory_tokens)
     return results
 
 
-def evaluate_one_instance(instance_idx: int, adaptors_to_run: List[str], limit: int, storage_dir: str, mode: str, output_suffix: str = "", print_scores: bool = True):
+def evaluate_one_instance(
+    instance_idx: int,
+    adaptors_to_run: List[str],
+    limit: int,
+    storage_dir: str,
+    mode: str,
+    output_suffix: str = "",
+    print_scores: bool = True,
+):
     data = load_benchmark_data("MemoryAgentBench/data/Accurate_Retrieval-00000-of-00001.parquet", instance_idx)
     questions = list(data["questions"])
-    workspace = Path(storage_dir) / f"lightrag_acc_ret_{instance_idx}"
+    workspace_name = f"lightrag_acc_ret_{instance_idx}"
+    if output_suffix:
+        workspace_name += f"_{output_suffix}"
+    workspace = Path(storage_dir) / workspace_name
     if not workspace.exists():
-        logger.error("LightRAG workspace not found: %s", workspace)
-        return
+        fallback_workspace = Path(storage_dir) / f"lightrag_acc_ret_{instance_idx}"
+        if fallback_workspace.exists():
+            logger.warning("Workspace with suffix not found, fallback to %s", fallback_workspace)
+            workspace = fallback_workspace
+        else:
+            logger.error("LightRAG workspace not found: %s", workspace)
+            return
 
+    logger.info("[infer-debug] instance=%s workspace=%s adaptors=%s limit=%s", instance_idx, workspace, adaptors_to_run, limit)
     memory = LightRAGMemory(working_dir=str(workspace), mode=mode)
     results: Dict[str, list] = {}
     for adaptor_name in ["R1", "R2", "R3"]:
@@ -101,8 +143,14 @@ def evaluate_one_instance(instance_idx: int, adaptors_to_run: List[str], limit: 
         score_summary = score_and_annotate(final_report["results"], load_ground_truth_acc_ret(instance_idx))
         final_report["scores"] = {"mechanical_accuracy": score_summary}
         if print_scores:
-            for adaptor_name, m in score_summary.items():
-                logger.info("[%s] Accuracy=%.4f (%s/%s)", adaptor_name, m["accuracy"], m["correct_count"], m["total_questions"])
+            for adaptor_name, metrics in score_summary.items():
+                logger.info(
+                    "[%s] Accuracy=%.4f (%s/%s)",
+                    adaptor_name,
+                    metrics["accuracy"],
+                    metrics["correct_count"],
+                    metrics["total_questions"],
+                )
     except Exception as e:
         logger.warning("Scoring failed: %s", e)
 
@@ -121,12 +169,20 @@ def main():
     parser.add_argument("--limit", type=int, default=-1)
     parser.add_argument("--storage_dir", type=str, default="out/lightrag_storage")
     parser.add_argument("--mode", type=str, default="naive", choices=["naive", "mix", "local", "global", "hybrid"])
-    parser.add_argument("--output_suffix", type=str, default="lightrag")
+    parser.add_argument("--output_suffix", type=str, default="")
     parser.add_argument("--no_print_scores", action="store_true")
     args = parser.parse_args()
 
     for idx in parse_instance_indices(args.instance_idx):
-        evaluate_one_instance(idx, args.adaptor, args.limit, args.storage_dir, args.mode, args.output_suffix, not args.no_print_scores)
+        evaluate_one_instance(
+            idx,
+            args.adaptor,
+            args.limit,
+            args.storage_dir,
+            args.mode,
+            args.output_suffix,
+            not args.no_print_scores,
+        )
 
 
 if __name__ == "__main__":

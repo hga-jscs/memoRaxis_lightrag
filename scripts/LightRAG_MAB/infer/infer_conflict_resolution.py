@@ -14,7 +14,14 @@ from src.runner_utils import run_one_question
 logger = get_logger()
 
 
-def evaluate_instance(instance_idx: int, adaptors: list, limit: int = -1, output_suffix: str = "", storage_dir: str = "out/lightrag_storage", mode: str = "naive"):
+def evaluate_instance(
+    instance_idx: int,
+    adaptors: list,
+    limit: int = -1,
+    output_suffix: str = "",
+    storage_dir: str = "out/lightrag_storage",
+    mode: str = "naive",
+):
     logger.info("=== Evaluating Conflict_Resolution Instance %s (LightRAG) ===", instance_idx)
 
     data_path = Path(f"MemoryAgentBench/preview_samples/Conflict_Resolution/instance_{instance_idx}.json")
@@ -23,11 +30,20 @@ def evaluate_instance(instance_idx: int, adaptors: list, limit: int = -1, output
         return
 
     data = json.loads(data_path.read_text(encoding="utf-8"))
-    workspace = Path(storage_dir) / f"lightrag_conflict_{instance_idx}"
+    workspace_name = f"lightrag_conflict_{instance_idx}"
+    if output_suffix:
+        workspace_name += f"_{output_suffix}"
+    workspace = Path(storage_dir) / workspace_name
     if not workspace.exists():
-        logger.error("LightRAG workspace not found: %s (run ingest first)", workspace)
-        return
+        fallback_workspace = Path(storage_dir) / f"lightrag_conflict_{instance_idx}"
+        if fallback_workspace.exists():
+            logger.warning("Workspace with suffix not found, fallback to %s", fallback_workspace)
+            workspace = fallback_workspace
+        else:
+            logger.error("LightRAG workspace not found: %s (run ingest first)", workspace)
+            return
 
+    logger.info("[infer-debug] instance=%s workspace=%s adaptors=%s limit=%s", instance_idx, workspace, adaptors, limit)
     memory = LightRAGMemory(working_dir=str(workspace), mode=mode)
     questions, answers = data["questions"], data["answers"]
     if limit > 0:
@@ -48,7 +64,13 @@ def evaluate_instance(instance_idx: int, adaptors: list, limit: int = -1, output
                     instance_idx=instance_idx,
                     question_idx=i,
                 )
-                logger.info("[%s] token_debug=%s", adaptor_name, json.dumps(report.get("by_stage", {}), ensure_ascii=False))
+                memory_token_summary = report.get("memory", {})
+                logger.info(
+                    "[%s] token_debug llm=%s memory_total=%s",
+                    adaptor_name,
+                    json.dumps(report.get("by_stage", {}), ensure_ascii=False),
+                    memory_token_summary.get("total", {}).get("total_tokens", 0),
+                )
                 adaptor_results.append({
                     "question": q,
                     "answer": res.answer,
@@ -59,11 +81,18 @@ def evaluate_instance(instance_idx: int, adaptors: list, limit: int = -1, output
                     "token_report": report,
                     "token_breakdown": res.token_breakdown,
                     "memory_token_breakdown": res.memory_token_breakdown,
+                    "memory_token_summary": memory_token_summary,
                 })
             except Exception as e:
                 logger.error("Error on Q%s: %s", i, e)
                 adaptor_results.append({"question": q, "error": str(e)})
 
+        total_memory_tokens = sum(
+            item.get("memory_token_summary", {}).get("total", {}).get("total_tokens", 0)
+            for item in adaptor_results
+            if "memory_token_summary" in item
+        )
+        logger.info("[%s] Total Memory Tokens: %s", adaptor_name, total_memory_tokens)
         results["results"][adaptor_name] = adaptor_results
 
     output_dir = Path("out")
